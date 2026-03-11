@@ -1,0 +1,19 @@
+# Fichiers à ignorer pour GitHub (trop volumineux)
+yolo_dataset_ultra/
+runs/classify/sign_classification_ultra_fast2/
+*.pt
+*.pth
+*.h5
+*.pkl
+*.zip
+*.tar.gz
+
+# Dossiers temporaires
+__pycache__/
+*.pyc
+.pytest_cache/
+.vscode/
+
+# Logs
+*.log
+wandb/
