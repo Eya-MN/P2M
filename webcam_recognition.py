@@ -13,9 +13,14 @@ CAMERA_DEVICE_NAME = ""  # e.g. "video=Integrated Camera" (DirectShow). Leave em
 
 # Prediction settings
 IMG_SIZE = 224
-CONF_THRESHOLD = 0.60  # below this, we display 'unknown'
+CONF_THRESHOLD = 0.65  # below this, we display 'unknown'
 SMOOTHING_WINDOW = 12  # number of recent frames to vote on
 PREDICT_EVERY_N_FRAMES = 2  # speed-up (predict 1 frame out of N)
+
+# No gesture/unknown settings
+NO_GESTURE_LABEL = "no_sign"
+UNKNOWN_GESTURE_LABEL = "unknown"
+MIN_ROI_AREA = 80 * 80  # if cropped ROI is very small, treat as no sign
 
 # Cropping pipeline settings
 USE_CROPPING = True
@@ -39,6 +44,21 @@ def majority_vote(items: deque[str]) -> str | None:
 
 def clamp(val: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, val))
+
+
+def ensure_bgr(frame):
+    if frame is None:
+        return frame
+    if frame.ndim == 2 or (frame.ndim == 3 and frame.shape[2] == 1):
+        return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    return frame
+
+
+def is_valid_roi(roi):
+    if roi is None:
+        return False
+    h, w = roi.shape[:2]
+    return h * w >= MIN_ROI_AREA
 
 
 def crop_with_person_box(frame, box_xyxy, margin: float, upper_ratio: float):
@@ -125,6 +145,7 @@ def crop_with_hand_keypoints(frame, kpts_xy, margin: float):
 
 def main() -> None:
     model = YOLO(MODEL_PATH)
+    known_gestures = set(model.names.values())
     pose = YOLO(POSE_MODEL_PATH) if (USE_CROPPING and USE_HAND_CROP) else None
     detector = YOLO(DETECT_MODEL_PATH) if USE_CROPPING else None
 
@@ -194,11 +215,14 @@ def main() -> None:
         if not ok:
             break
 
+        frame = ensure_bgr(frame)
         frame_idx += 1
 
-        # 1) Detect hands (pose) then compute crop box (fallback to person)
+        # 0) If no person/hands detected and we have a small or empty ROI, label no_sign
         roi = frame
         crop_box = None
+        hand_crop_detected = False
+        person_crop_detected = False
 
         if cropping_enabled:
             h, w = frame.shape[:2]
@@ -232,6 +256,7 @@ def main() -> None:
                             last_crop_box = crop_box
                             last_det_frame = frame_idx
                             got_hand_crop = True
+                            hand_crop_detected = True
 
                 # Fallback to person crop if no hand crop
                 if (not got_hand_crop) and detector is not None:
@@ -255,6 +280,7 @@ def main() -> None:
                         )
                         last_crop_box = crop_box
                         last_det_frame = frame_idx
+                        person_crop_detected = True
                     else:
                         last_crop_box = None
 
@@ -263,19 +289,34 @@ def main() -> None:
                 x1, y1, x2, y2 = last_crop_box
                 roi = frame[y1:y2, x1:x2]
                 crop_box = last_crop_box
+                person_crop_detected = True
 
         # 2) Classify the ROI
         if frame_idx % PREDICT_EVERY_N_FRAMES == 0:
-            # Ultralytics accepts numpy frames directly
-            result = model.predict(roi, imgsz=IMG_SIZE, verbose=False)[0]
-            top1_idx = int(result.probs.top1)
-            conf = float(result.probs.top1conf)
-            label = result.names[top1_idx]
-
-            if conf < CONF_THRESHOLD:
-                label_to_store = "unknown"
+            # Strong guard: if hand crop is expected but missing, do not predict false positive 26-class
+            if cropping_enabled and USE_HAND_CROP and not hand_crop_detected:
+                label_to_store = NO_GESTURE_LABEL
+                conf = 0.0
+            elif cropping_enabled and (crop_box is None or not is_valid_roi(roi)):
+                label_to_store = NO_GESTURE_LABEL
+                conf = 0.0
             else:
-                label_to_store = label
+                # Ultralytics accepts numpy frames directly
+                roi = ensure_bgr(roi)
+                result = model.predict(roi, imgsz=IMG_SIZE, verbose=False)[0]
+                top1_idx = int(result.probs.top1)
+                conf = float(result.probs.top1conf)
+                label = result.names[top1_idx]
+
+                if conf < CONF_THRESHOLD:
+                    label_to_store = UNKNOWN_GESTURE_LABEL
+                elif label not in known_gestures:
+                    label_to_store = UNKNOWN_GESTURE_LABEL
+                elif label.lower() == "work" and conf < 0.88:
+                    # neutraliser le biais de fausses prédictions sur le label le plus fréquent
+                    label_to_store = UNKNOWN_GESTURE_LABEL
+                else:
+                    label_to_store = label
 
             recent_preds.append(label_to_store)
             smoothed = majority_vote(recent_preds) or label_to_store
@@ -295,7 +336,8 @@ def main() -> None:
 
         if cropping_enabled:
             if USE_HAND_CROP:
-                text4 = f"Crop: HANDS (margin={BOX_MARGIN:.2f})"
+                source = "HAND" if hand_crop_detected else "PERSON (fallback)"
+                text4 = f"Crop: {source} (margin={BOX_MARGIN:.2f})"
             else:
                 text4 = f"Crop: PERSON (upper={UPPER_BODY_RATIO:.2f}, margin={BOX_MARGIN:.2f})"
         else:
